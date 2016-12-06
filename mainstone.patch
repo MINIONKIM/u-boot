@@ -1,0 +1,2082 @@
+diff -urNp u-boot/board/mainstone/config.mk u-boot-mainstone/board/mainstone/config.mk
+--- u-boot/board/mainstone/config.mk	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/board/mainstone/config.mk	2006-03-09 15:55:13.922100032 +0100
+@@ -0,0 +1,3 @@
++#TEXT_BASE = 0xa1700000
++TEXT_BASE = 0xa3080000
++#TEXT_BASE = 0
+diff -urNp u-boot/board/mainstone/flash.c u-boot-mainstone/board/mainstone/flash.c
+--- u-boot/board/mainstone/flash.c	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/board/mainstone/flash.c	2005-09-22 12:55:35.000000000 +0200
+@@ -0,0 +1,459 @@
++/*
++ * (C) Copyright 2001
++ * Kyle Harris, Nexus Technologies, Inc. kharris@nexus-tech.net
++ *
++ * (C) Copyright 2001
++ * Wolfgang Denk, DENX Software Engineering, wd@denx.de.
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include <common.h>
++#include <linux/byteorder/swab.h>
++
++
++flash_info_t flash_info[CFG_MAX_FLASH_BANKS];	/* info for FLASH chips    */
++
++/* Board support for 1 or 2 flash devices */
++#define FLASH_PORT_WIDTH32
++#undef FLASH_PORT_WIDTH16
++
++#ifdef FLASH_PORT_WIDTH16
++#define FLASH_PORT_WIDTH		ushort
++#define FLASH_PORT_WIDTHV		vu_short
++#define SWAP(x)               __swab16(x)
++#else
++#define FLASH_PORT_WIDTH		ulong
++#define FLASH_PORT_WIDTHV		vu_long
++#define SWAP(x)               __swab32(x)
++#endif
++
++#define FPW	   FLASH_PORT_WIDTH
++#define FPWV   FLASH_PORT_WIDTHV
++
++#define mb() __asm__ __volatile__ ("" : : : "memory")
++
++/*-----------------------------------------------------------------------
++ * Functions
++ */
++static ulong flash_get_size (FPW *addr, flash_info_t *info);
++static int write_data (flash_info_t *info, ulong dest, FPW data);
++static void flash_get_offsets (ulong base, flash_info_t *info);
++void inline spin_wheel (void);
++
++/*-----------------------------------------------------------------------
++ */
++
++unsigned long flash_init (void)
++{
++	int i;
++	ulong size = 0;
++
++	for (i = 0; i < CFG_MAX_FLASH_BANKS; i++) {
++		switch (i) {
++		case 0:
++			flash_get_size ((FPW *) PHYS_FLASH_1, &flash_info[i]);
++			flash_get_offsets (PHYS_FLASH_1, &flash_info[i]);
++			break;
++		case 1:
++			flash_get_size ((FPW *) PHYS_FLASH_2, &flash_info[i]);
++			flash_get_offsets (PHYS_FLASH_2, &flash_info[i]);
++			break;
++		default:
++			panic ("configured too many flash banks!\n");
++			break;
++		}
++		size += flash_info[i].size;
++	}
++
++	/* Protect monitor and environment sectors
++	 */
++	flash_protect ( FLAG_PROTECT_SET,
++			CFG_FLASH_BASE,
++			CFG_FLASH_BASE + monitor_flash_len - 1,
++			&flash_info[0] );
++
++	flash_protect ( FLAG_PROTECT_SET,
++			CFG_ENV_ADDR,
++			CFG_ENV_ADDR + CFG_ENV_SIZE - 1, &flash_info[0] );
++
++	return size;
++}
++
++/*-----------------------------------------------------------------------
++ */
++static void flash_get_offsets (ulong base, flash_info_t *info)
++{
++	int i;
++
++	if (info->flash_id == FLASH_UNKNOWN) {
++		return;
++	}
++
++	if ((info->flash_id & FLASH_VENDMASK) == FLASH_MAN_INTEL) {
++		for (i = 0; i < info->sector_count; i++) {
++			info->start[i] = base + (i * PHYS_FLASH_SECT_SIZE);
++			info->protect[i] = 0;
++		}
++	}
++}
++
++/*-----------------------------------------------------------------------
++ */
++void flash_print_info (flash_info_t *info)
++{
++	int i;
++
++	if (info->flash_id == FLASH_UNKNOWN) {
++		printf ("missing or unknown FLASH type\n");
++		return;
++	}
++
++	switch (info->flash_id & FLASH_VENDMASK) {
++	case FLASH_MAN_INTEL:
++		printf ("INTEL ");
++		break;
++	default:
++		printf ("Unknown Vendor ");
++		break;
++	}
++
++	switch (info->flash_id & FLASH_TYPEMASK) {
++	case FLASH_28F128J3A:
++		printf ("28F128J3A\n");
++		break;
++	case FLASH_28F128K3:
++		printf ("28F128K3\n");
++		break;
++	default:
++		printf ("Unknown Chip Type\n");
++		break;
++	}
++
++	printf ("  Size: %ld MB in %d Sectors\n",
++			info->size >> 20, info->sector_count);
++
++	printf ("  Sector Start Addresses:");
++	for (i = 0; i < info->sector_count; ++i) {
++		if ((i % 5) == 0)
++			printf ("\n   ");
++		printf (" %08lX%s",
++			info->start[i],
++			info->protect[i] ? " (RO)" : "     ");
++	}
++	printf ("\n");
++	return;
++}
++
++/*
++ * The following code cannot be run from FLASH!
++ */
++static ulong flash_get_size (FPW *addr, flash_info_t *info)
++{
++	volatile FPW value;
++
++	/* Write auto select command: read Manufacturer ID */
++	addr[0x5555] = (FPW) 0x00AA00AA;
++	addr[0x2AAA] = (FPW) 0x00550055;
++	addr[0x5555] = (FPW) 0x00900090;
++
++	mb ();
++	value = addr[0];
++
++	switch (value) {
++
++	case (FPW) INTEL_MANUFACT:
++		info->flash_id = FLASH_MAN_INTEL;
++		break;
++
++	default:
++		info->flash_id = FLASH_UNKNOWN;
++		info->sector_count = 0;
++		info->size = 0;
++		addr[0] = (FPW) 0x00FF00FF;	/* restore read mode */
++		return (0);			/* no or unknown flash  */
++	}
++
++	mb ();
++	value = addr[1];			/* device ID        */
++
++	switch (value) {
++
++	case (FPW) INTEL_ID_28F128J3A:
++		info->flash_id += FLASH_28F128J3A;
++		info->sector_count = 128;
++		info->size = 0x02000000;
++		break;				/* => 16 MB     */
++                
++	case (FPW) INTEL_ID_28F128K3:
++		info->flash_id += FLASH_28F128K3;
++		info->sector_count = 128;
++		info->size = 0x02000000;
++		break;				/* =>  128M = 8M x 16     */
++	default:
++		info->flash_id = FLASH_UNKNOWN;
++		break;
++	}
++
++	if (info->sector_count > CFG_MAX_FLASH_SECT) {
++		printf ("** ERROR: sector count %d > max (%d) **\n",
++			info->sector_count, CFG_MAX_FLASH_SECT);
++		info->sector_count = CFG_MAX_FLASH_SECT;
++	}
++
++	addr[0] = (FPW) 0x00FF00FF;		/* restore read mode */
++
++	return (info->size);
++}
++
++
++/*-----------------------------------------------------------------------
++ */
++
++int flash_erase (flash_info_t *info, int s_first, int s_last)
++{
++	int flag, prot, sect;
++	ulong type, start, last;
++	int rcode = 0;
++
++	if ((s_first < 0) || (s_first > s_last)) {
++		if (info->flash_id == FLASH_UNKNOWN) {
++			printf ("- missing\n");
++		} else {
++			printf ("- no sectors to erase\n");
++		}
++		return 1;
++	}
++
++	type = (info->flash_id & FLASH_VENDMASK);
++	if ((type != FLASH_MAN_INTEL)) {
++		printf ("Can't erase unknown flash type %08lx - aborted\n",
++			info->flash_id);
++		return 1;
++	}
++
++	prot = 0;
++	for (sect = s_first; sect <= s_last; ++sect) {
++		if (info->protect[sect]) {
++			prot++;
++		}
++	}
++
++	if (prot) {
++		printf ("- Warning: %d protected sectors will not be erased!\n",
++			prot);
++	} else {
++		printf ("\n");
++	}
++
++	start = get_timer (0);
++	last = start;
++
++	/* Disable interrupts which might cause a timeout here */
++	flag = disable_interrupts ();
++
++	/* Start erase on unprotected sectors */
++	for (sect = s_first; sect <= s_last; sect++) {
++		if (info->protect[sect] == 0) {	/* not protected */
++			FPWV *addr = (FPWV *) (info->start[sect]);
++			FPW status;
++
++			printf ("Unlocking sector %2d ... ", sect);
++
++			/* arm simple, non interrupt dependent timer */
++			reset_timer_masked ();
++			*addr = (FPW) 0x00500050;	/* clear status register */
++			*addr = (FPW) 0x00600060;	/* unlock */
++			*addr = (FPW) 0x00D000D0;	/* unlock confirm */
++
++                        while (((status = *addr) & (FPW) 0x00800080) != (FPW) 0x00800080) {
++				if (get_timer_masked () > CFG_FLASH_ERASE_TOUT) {
++					printf ("Timeout\n");
++					*addr = (FPW) 0x00B000B0;	/* suspend unlock     */
++					*addr = (FPW) 0x00FF00FF;	/* reset to read mode */
++					rcode = 1;
++					break;
++				}
++			} 
++			*addr = 0x00500050;	/* clear status register cmd.   */
++			*addr = 0x00FF00FF;	/* resest to read mode          */
++			
++                        printf ("Erasing sector %2d ... ", sect);
++
++			/* arm simple, non interrupt dependent timer */
++			reset_timer_masked ();
++
++			*addr = (FPW) 0x00500050;	/* clear status register */
++			*addr = (FPW) 0x00200020;	/* erase setup */
++			*addr = (FPW) 0x00D000D0;	/* erase confirm */
++
++			while (((status = *addr) & (FPW) 0x00800080) != (FPW) 0x00800080) {
++				if (get_timer_masked () > CFG_FLASH_ERASE_TOUT) {
++					printf ("Timeout\n");
++					*addr = (FPW) 0x00B000B0;	/* suspend erase     */
++					*addr = (FPW) 0x00FF00FF;	/* reset to read mode */
++					rcode = 1;
++					break;
++				}
++			}
++
++			*addr = 0x00500050;	/* clear status register cmd.   */
++			*addr = 0x00FF00FF;	/* resest to read mode          */
++
++			printf (" done\n");
++		}
++	}
++	return rcode;
++}
++
++/*-----------------------------------------------------------------------
++ * Copy memory to flash, returns:
++ * 0 - OK
++ * 1 - write timeout
++ * 2 - Flash not erased
++ * 4 - Flash not identified
++ */
++
++int write_buff (flash_info_t *info, uchar *src, ulong addr, ulong cnt)
++{
++	ulong cp, wp;
++	FPW data;
++	int count, i, l, rc, port_width;
++
++	if (info->flash_id == FLASH_UNKNOWN) {
++		return 4;
++	}
++/* get lower word aligned address */
++#ifdef FLASH_PORT_WIDTH16
++	wp = (addr & ~1);
++	port_width = 2;
++#else
++	wp = (addr & ~3);
++	port_width = 4;
++#endif
++
++	/*
++	 * handle unaligned start bytes
++	 */
++	if ((l = addr - wp) != 0) {
++		data = 0;
++		for (i = 0, cp = wp; i < l; ++i, ++cp) {
++			data = (data << 8) | (*(uchar *) cp);
++		}
++		for (; i < port_width && cnt > 0; ++i) {
++			data = (data << 8) | *src++;
++			--cnt;
++			++cp;
++		}
++		for (; cnt == 0 && i < port_width; ++i, ++cp) {
++			data = (data << 8) | (*(uchar *) cp);
++		}
++
++		if ((rc = write_data (info, wp, SWAP (data))) != 0) {
++			return (rc);
++		}
++		wp += port_width;
++	}
++
++	/*
++	 * handle word aligned part
++	 */
++	count = 0;
++	while (cnt >= port_width) {
++		data = 0;
++		for (i = 0; i < port_width; ++i) {
++			data = (data << 8) | *src++;
++		}
++		if ((rc = write_data (info, wp, SWAP (data))) != 0) {
++			return (rc);
++		}
++		wp += port_width;
++		cnt -= port_width;
++		if (count++ > 0x800) {
++			spin_wheel ();
++			count = 0;
++		}
++	}
++
++	if (cnt == 0) {
++		return (0);
++	}
++
++	/*
++	 * handle unaligned tail bytes
++	 */
++	data = 0;
++	for (i = 0, cp = wp; i < port_width && cnt > 0; ++i, ++cp) {
++		data = (data << 8) | *src++;
++		--cnt;
++	}
++	for (; i < port_width; ++i, ++cp) {
++		data = (data << 8) | (*(uchar *) cp);
++	}
++
++	return (write_data (info, wp, SWAP (data)));
++}
++
++/*-----------------------------------------------------------------------
++ * Write a word or halfword to Flash, returns:
++ * 0 - OK
++ * 1 - write timeout
++ * 2 - Flash not erased
++ */
++static int write_data (flash_info_t *info, ulong dest, FPW data)
++{
++	FPWV *addr = (FPWV *) dest;
++	ulong status;
++	int flag;
++
++	/* Check if Flash is (sufficiently) erased */
++	if ((*addr & data) != data) {
++		printf ("not erased at %08lx (%lx)\n", (ulong) addr, *addr);
++		return (2);
++	}
++	/* Disable interrupts which might cause a timeout here */
++	flag = disable_interrupts ();
++
++	*addr = (FPW) 0x00400040;	/* write setup */
++	*addr = data;
++
++	/* arm simple, non interrupt dependent timer */
++	reset_timer_masked ();
++
++	/* wait while polling the status register */
++	while (((status = *addr) & (FPW) 0x00800080) != (FPW) 0x00800080) {
++		if (get_timer_masked () > CFG_FLASH_WRITE_TOUT) {
++			*addr = (FPW) 0x00FF00FF;	/* restore read mode */
++			return (1);
++		}
++	}
++
++	*addr = (FPW) 0x00FF00FF;	/* restore read mode */
++
++	return (0);
++}
++
++void inline spin_wheel (void)
++{
++	static int p = 0;
++	static char w[] = "\\/-";
++
++	printf ("\010%c", w[p]);
++	(++p == 3) ? (p = 0) : 0;
++}
+diff -urNp u-boot/board/mainstone/lowlevel_init.S u-boot-mainstone/board/mainstone/lowlevel_init.S
+--- u-boot/board/mainstone/lowlevel_init.S	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/board/mainstone/lowlevel_init.S	2006-03-09 15:55:13.922100032 +0100
+@@ -0,0 +1,555 @@
++/*
++ * board/mainstone/lowlwvel_init.S
++ *
++ * Configuration settings for the Intel HCDDBBVA0 aka PXA270 Mainstone board.
++ *
++ * (C) Copyright 2006 Koan Software Engineering - Bergamo - ITALIA
++ *                    Marco Cavallini,  <m.cavallini@koansoftware.com>
++ *
++ * This was originally from the Lubbock u-boot port and from BLOB with cleanup
++ *
++ * NOTE: I haven't clean this up considerably, just enough to get it
++ * running. See hal_platform_setup.h for the source. See
++ * board/cradle/lowlevel_init.S for another PXA250 setup that is
++ * much cleaner.
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include <config.h>
++#include <version.h>
++#include <asm/arch/pxa-regs.h>
++
++/* wait for coprocessor write complete */
++   .macro CPWAIT reg
++   mrc	p15,0,\reg,c2,c0,0
++   mov	\reg,\reg
++   sub	pc,pc,#4
++   .endm
++
++/*********** Write out to HEX 7 segment leds *********/
++
++#define DEBUG_HEXLOG
++
++#ifdef DEBUG_HEXLOG
++#define LEDCTL		0x08000040
++#define LEDDAT1	0x08000010
++#define LEDDAT2	0x08000014
++
++.macro wait, count
++	mov		r10, \count
++0:
++	subs	r10, r10, #1
++	bne		0b
++.endm
++
++.macro hexlog_init
++	ldr		r11, =LEDCTL
++	mov		r10, #0xff
++	str		r10, [r11]
++	ldr		r11, =LEDDAT2
++	mov		r10, #0xFFFFFFFF
++	str		r10, [r11]
++	ldr		r11, =LEDDAT1
++	mov		r10, #0x0
++	str		r10, [r11]
++.endm
++
++.macro hexlog, val
++	ldr		r11, =LEDCTL
++	mov		r10, #0xff
++	str		r10, [r11]
++	ldr		r11, =LEDDAT2
++	mov		r10, #0xFFFFFFFF
++	str		r10, [r11]
++
++	ldr		r11, =LEDDAT1
++	mov		r10, \val
++	str		r10, [r11]
++
++	wait		#0x400000
++.endm
++
++#else
++
++.macro hexlog_init
++	nop
++.endm
++
++.macro hexlog, val
++	nop
++.endm
++
++#endif
++
++/***********************************/
++
++/*
++ *	Memory setup
++ */
++
++.globl lowlevel_init
++lowlevel_init:
++
++	/* Set up GPIO pins first */
++	
++	ldr		r0,	=GPSR0
++	ldr		r1,	=CFG_GPSR0_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPSR1
++	ldr		r1,	=CFG_GPSR1_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPSR2
++	ldr		r1,	=CFG_GPSR2_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPSR3
++	ldr		r1,	=CFG_GPSR3_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPCR0
++	ldr		r1,	=CFG_GPCR0_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPCR1
++	ldr		r1,	=CFG_GPCR1_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPCR2
++	ldr		r1,	=CFG_GPCR2_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPCR3
++	ldr		r1,	=CFG_GPCR3_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPDR0
++	ldr		r1,	=CFG_GPDR0_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPDR1
++	ldr		r1,	=CFG_GPDR1_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPDR2
++	ldr		r1,	=CFG_GPDR2_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GPDR3
++	ldr		r1,	=CFG_GPDR3_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GAFR0_L
++	ldr		r1,	=CFG_GAFR0_L_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GAFR0_U
++	ldr		r1,	=CFG_GAFR0_U_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GAFR1_L
++	ldr		r1,	=CFG_GAFR1_L_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GAFR1_U
++	ldr		r1,	=CFG_GAFR1_U_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GAFR2_L
++	ldr		r1,	=CFG_GAFR2_L_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GAFR2_U
++	ldr		r1,	=CFG_GAFR2_U_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GAFR3_L
++	ldr		r1,	=CFG_GAFR3_L_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=GAFR3_U
++	ldr		r1,	=CFG_GAFR3_U_VAL
++	str		r1,   [r0]
++
++	ldr		r0,	=PSSR		/* enable GPIO pins */
++	ldr		r1,	=CFG_PSSR_VAL
++	str		r1,   [r0]
++
++	/* ---------------------------------------------------------------- */
++	/* Enable memory interface					    */
++	/*								    */
++	/* The sequence below is based on the recommended init steps	    */
++	/* detailed in the Intel PXA250 Operating Systems Developers Guide, */
++	/* Chapter 10.							    */
++	/* ---------------------------------------------------------------- */
++
++	hexlog_init
++	hexlog #0x0 	/* HEXLOG */
++
++	/* ---------------------------------------------------------------- */
++	/* Step 1: Wait for at least 200 microseconds to allow internal	    */
++	/*	   clocks to settle. Only necessary after hard reset...	    */
++	/*	   FIXME: can be optimized later			    */
++	/* ---------------------------------------------------------------- */
++
++	ldr r3, =OSCR			/* reset the OS Timer Count to zero */
++	mov r2, #0
++	str r2, [r3]
++	ldr r4, =0x300			/* really 0x2E1 is about 200usec,   */
++						/* so 0x300 should be plenty	    */
++1:
++	ldr r2, [r3]
++	cmp r4, r2
++	bgt 1b
++
++mem_init:
++
++	ldr	r1,  =MEMC_BASE		/* get memory controller base addr. */
++
++	/* ---------------------------------------------------------------- */
++	/* Step 2a: Initialize Asynchronous static memory controller	    */
++	/* ---------------------------------------------------------------- */
++
++	hexlog #0x1 	/* HEXLOG */
++
++	/* MSC registers: timing, bus width, mem type			    */
++
++	/* MSC0: nCS(0,1)						    */
++#ifdef CFG_MSC0_VAL
++	ldr	r2,   =CFG_MSC0_VAL
++	str	r2,   [r1, #MSC0_OFFSET]
++	ldr	r2,   [r1, #MSC0_OFFSET]		/* read back to ensure	    */
++										/* that data latches	    */
++ #endif
++ 
++	/* MSC1: nCS(2,3)						    */
++	ldr	r2,  =CFG_MSC1_VAL
++	str	r2,  [r1, #MSC1_OFFSET]
++	ldr	r2,  [r1, #MSC1_OFFSET]
++
++	/* MSC2: nCS(4,5)						    */
++	ldr	r2,  =CFG_MSC2_VAL
++	str	r2,  [r1, #MSC2_OFFSET]
++	ldr	r2,  [r1, #MSC2_OFFSET]
++
++	/* ---------------------------------------------------------------- */
++	/* Step 2b: Initialize Card Interface				    */
++	/* ---------------------------------------------------------------- */
++
++	hexlog #0x2 	/* HEXLOG */
++
++	/* MECR: Memory Expansion Card Register				    */
++	ldr	r2,  =CFG_MECR_VAL
++	str	r2,  [r1, #MECR_OFFSET]
++	ldr	r2,	[r1, #MECR_OFFSET]
++
++	/* MCMEM0: Card Interface slot 0 timing				    */
++	ldr	r2,  =CFG_MCMEM0_VAL
++	str	r2,  [r1, #MCMEM0_OFFSET]
++	ldr	r2,	[r1, #MCMEM0_OFFSET]
++
++	/* MCMEM1: Card Interface slot 1 timing				    */
++	ldr	r2,  =CFG_MCMEM1_VAL
++	str	r2,  [r1, #MCMEM1_OFFSET]
++	ldr	r2,	[r1, #MCMEM1_OFFSET]
++
++	/* MCATT0: Card Interface Attribute Space Timing, slot 0	    */
++	ldr	r2,  =CFG_MCATT0_VAL
++	str	r2,  [r1, #MCATT0_OFFSET]
++	ldr	r2,	[r1, #MCATT0_OFFSET]
++
++	/* MCATT1: Card Interface Attribute Space Timing, slot 1	    */
++	ldr	r2,  =CFG_MCATT1_VAL
++	str	r2,  [r1, #MCATT1_OFFSET]
++	ldr	r2,	[r1, #MCATT1_OFFSET]
++
++	/* MCIO0: Card Interface I/O Space Timing, slot 0		    */
++	ldr	r2,  =CFG_MCIO0_VAL
++	str	r2,  [r1, #MCIO0_OFFSET]
++	ldr	r2,	[r1, #MCIO0_OFFSET]
++
++	/* MCIO1: Card Interface I/O Space Timing, slot 1		    */
++	ldr	r2,  =CFG_MCIO1_VAL
++	str	r2,  [r1, #MCIO1_OFFSET]
++	ldr	r2,	[r1, #MCIO1_OFFSET]
++
++	/* ---------------------------------------------------------------- */
++	/* Step 2c: Write FLYCNFG  FIXME: what's that???		    */
++	/* ---------------------------------------------------------------- */
++	ldr	r2,  =CFG_FLYCNFG_VAL
++	str	r2,  [r1, #FLYCNFG_OFFSET]
++	str	r2,	[r1, #FLYCNFG_OFFSET]
++
++	/* ---------------------------------------------------------------- */
++	/* Step 2d: Initialize Timing for Sync Memory (SDCLK0)		    */
++	/* ---------------------------------------------------------------- */
++
++	/* Before accessing MDREFR we need a valid DRI field, so we set	    */
++	/* this to power on defaults + DRI field.			    */
++
++	ldr	r4,	[r1, #MDREFR_OFFSET]
++	ldr	r2,	=0xFFF
++	bic	r4,	r4, r2
++
++	ldr	r3,	=CFG_MDREFR_VAL
++	and	r3,	r3,  r2
++
++	orr	r4,	r4, r3
++	str	r4,	[r1, #MDREFR_OFFSET]	/* write back MDREFR	    */
++
++	orr	r4,  r4, #MDREFR_K0RUN
++	orr	r4,  r4, #MDREFR_K0DB4
++	orr	r4,  r4, #MDREFR_K0FREE
++	orr	r4,  r4, #MDREFR_K0DB2
++	orr	r4,  r4, #MDREFR_K1DB2
++	bic	r4,  r4, #MDREFR_K1FREE
++	bic	r4,  r4, #MDREFR_K2FREE
++
++	str	r4,	[r1, #MDREFR_OFFSET]	/* write back MDREFR	    */
++	ldr	r4,  [r1, #MDREFR_OFFSET]
++
++	/* Note: preserve the mdrefr value in r4			    */
++
++	hexlog #0x3	 /* HEXLOG */
++
++	/* ---------------------------------------------------------------- */
++	/* Step 3: Initialize Synchronous Static Memory (Flash/Peripherals) */
++	/* ---------------------------------------------------------------- */
++
++	/* Initialize SXCNFG register. Assert the enable bits		    */
++
++	/* Write SXMRS to cause an MRS command to all enabled banks of	    */
++	/* synchronous static memory. Note that SXLCR need not be written   */
++	/* at this time.						    */
++
++	ldr	r2,  =CFG_SXCNFG_VAL
++	str	r2,  [r1, #SXCNFG_OFFSET]
++
++	/* ---------------------------------------------------------------- */
++	/* Step 4: Initialize SDRAM					    */
++	/* ---------------------------------------------------------------- */
++
++	hexlog #0x4 	/* HEXLOG */
++	
++	bic	r4, r4, #(MDREFR_K2FREE |MDREFR_K1FREE | MDREFR_K0FREE)
++
++	orr	r4, r4, #MDREFR_K1RUN
++	bic	r4, r4, #MDREFR_K2DB2
++	str	r4, [r1, #MDREFR_OFFSET]
++	ldr	r4, [r1, #MDREFR_OFFSET]
++
++	bic	r4, r4, #MDREFR_SLFRSH
++	str	r4, [r1, #MDREFR_OFFSET]
++	ldr	r4, [r1, #MDREFR_OFFSET]
++
++	orr	r4, r4, #MDREFR_E1PIN
++	str	r4, [r1, #MDREFR_OFFSET]
++	ldr	r4, [r1, #MDREFR_OFFSET]
++
++	hexlog #0x5 	/* HEXLOG */
++
++	nop
++	nop
++
++
++	/* Step 4d: write MDCNFG with MDCNFG:DEx deasserted (set to 0), to  */
++	/*	    configure but not enable each SDRAM partition pair.	    */
++
++	/* fetch platform value of MDCNFG */
++	ldr	r4,	=CFG_MDCNFG_VAL
++	
++	/* disable all sdram banks */
++	bic	r4,	r4,	#(MDCNFG_DE0|MDCNFG_DE1)
++	bic	r4,	r4,	#(MDCNFG_DE2|MDCNFG_DE3)
++
++	/* write initial value of MDCNFG, w/o enabling sdram banks */
++	str	r4,	[r1, #MDCNFG_OFFSET]	/* write back MDCNFG	    */
++	ldr	r4,	[r1, #MDCNFG_OFFSET]
++
++
++	/* Step 4e: Wait for the clock to the SDRAMs to stabilize,	    */
++	/*	    100..200 µsec.					    */
++	/* The sequence below is based on the recommended init steps detailed */
++	/* in the Intel PXA255 Processor Developer's Manual Section 6.11 */
++
++	ldr r3, =OSCR			/* reset the OS Timer Count to zero */
++	mov r2, #0
++	str r2, [r3]
++	ldr r4, =0x300			/* really 0x2E1 is about 200usec,   */
++										/* so 0x300 should be plenty	    */
++1:
++    ldr r2, [r3]
++    cmp r4, r2
++    bgt 1b
++
++	/* Step 4f: Trigger a number (usually 8) refresh cycles by	    */
++	/*	    attempting non-burst read or write accesses to disabled */
++	/*	    SDRAM, as commonly specified in the power up sequence   */
++	/*	    documented in SDRAM data sheets. The address(es) used   */
++	/*	    for this purpose must not be cacheable.		    */
++
++	ldr	r3,	=CFG_DRAM_BASE
++	str	r2,	[r3]
++	str	r2,	[r3]
++	str	r2,	[r3]
++	str	r2,	[r3]
++	str	r2,	[r3]
++	str	r2,	[r3]
++	str	r2,	[r3]
++	str	r2,	[r3]
++
++
++	/* Step 4g: Write MDCNFG with enable bits asserted		    */
++	/*	    (MDCNFG:DEx set to 1).				    */
++
++	ldr	r3,	[r1, #MDCNFG_OFFSET]
++	mov	r4, r3
++	orr	r3,	r3,	#MDCNFG_DE0
++	str	r3,	[r1, #MDCNFG_OFFSET]
++	mov	r0, r3
++
++	/* Step 4h: Write MDMRS.					    */
++
++	ldr	r2,  =CFG_MDMRS_VAL
++	str	r2,  [r1, #MDMRS_OFFSET]
++
++	/* enable APD */
++	ldr	r3,  [r1, #MDREFR_OFFSET]
++	orr	r3,  r3,  #MDREFR_APD
++	str	r3,  [r1, #MDREFR_OFFSET]
++
++	/* We are finished with Intel's memory controller initialisation    */
++
++	hexlog #0x6 	/* HEXLOG */
++
++setvoltage:
++
++	mov	r10,	lr
++	bl	initPXAvoltage	/* In case the board is rebooting with a    */
++	mov	lr,	r10		/* low voltage raise it up to a good one.   */
++
++	hexlog #0x7 	/* HEXLOG */
++
++wakeup:
++	/* Are we waking from sleep? */
++	ldr	r0,	=RCSR
++	ldr	r1,	[r0]
++	and	r1,	r1, #(RCSR_GPR | RCSR_SMR | RCSR_WDR | RCSR_HWR)
++	str	r1,	[r0]
++	teq	r1,	#RCSR_SMR
++
++	bne	initirqs
++
++	ldr	r0,	=PSSR
++	mov	r1,	#PSSR_PH
++	str	r1,	[r0]
++
++	/* if so, resume at PSPR */
++	ldr	r0,	=PSPR
++	ldr	r1,	[r0]
++	mov	pc,	r1
++
++	hexlog #0x8 	/* HEXLOG */
++
++	/* ---------------------------------------------------------------- */
++	/* Disable (mask) all interrupts at interrupt controller	    */
++	/* ---------------------------------------------------------------- */
++
++initirqs:
++
++	mov	r1,  #0		/* clear int. level register (IRQ, not FIQ) */
++	ldr	r2,  =ICLR
++	str	r1,  [r2]
++
++	ldr	r2,  =ICMR	/* mask all interrupts at the controller    */
++	str	r1,  [r2]
++
++	/* ---------------------------------------------------------------- */
++	/* Clock initialisation						    */
++	/* ---------------------------------------------------------------- */
++
++initclks:
++
++	/* Disable the peripheral clocks, and set the core clock frequency  */
++
++	/* Turn Off on-chip peripheral clocks (except for memory)	    */
++	/* for re-configuration.					    */
++	ldr	r1,  =CKEN
++	ldr	r2,  =CFG_CKEN
++	str	r2,  [r1]
++
++	/* ... and write the core clock config register			    */
++	ldr	r2,  =CFG_CCCR
++	ldr	r1,  =CCCR
++	str	r2,  [r1]
++
++	/* Turn on turbo mode */
++	mrc	p14, 0, r2, c6, c0, 0
++	orr	r2, r2, #0xB		/* Turbo, Fast-Bus, Freq change**/
++	mcr	p14, 0, r2, c6, c0, 0
++
++	/* Re-write MDREFR */
++	ldr	r1, =MEMC_BASE
++	ldr	r2, [r1, #MDREFR_OFFSET]
++	str	r2, [r1, #MDREFR_OFFSET]
++#ifdef RTC
++	/* enable the 32Khz oscillator for RTC and PowerManager		    */
++	ldr	r1,  =OSCC
++	mov	r2,  #OSCC_OON
++	str	r2,  [r1]
++
++	/* NOTE:  spin here until OSCC.OOK get set, meaning the PLL	    */
++	/* has settled.							    */
++60:
++	ldr	r2, [r1]
++	ands	r2, r2, #1
++	beq	60b
++#else
++#error "RTC not defined"
++#endif
++
++	/* Interrupt init: Mask all interrupts				    */
++    ldr r0, =ICMR /* enable no sources */
++	mov r1, #0
++    str r1, [r0]
++	/* FIXME */
++
++#ifdef NODEBUG
++	/*Disable software and data breakpoints */
++	mov	r0,#0
++	mcr	p15,0,r0,c14,c8,0  /* ibcr0 */
++	mcr	p15,0,r0,c14,c9,0  /* ibcr1 */
++	mcr	p15,0,r0,c14,c4,0  /* dbcon */
++
++	/*Enable all debug functionality */
++	mov	r0,#0x80000000
++	mcr	p14,0,r0,c10,c0,0  /* dcsr */
++#endif
++
++	/* ---------------------------------------------------------------- */
++	/* End lowlevel_init							    */
++	/* ---------------------------------------------------------------- */
++
++	hexlog #0xf 		/* HEXLOG */
++
++endlowlevel_init:
++
++	mov	pc, lr
+diff -urNp u-boot/board/mainstone/mainstone.c u-boot-mainstone/board/mainstone/mainstone.c
+--- u-boot/board/mainstone/mainstone.c	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/board/mainstone/mainstone.c	2006-03-09 16:02:57.695595744 +0100
+@@ -0,0 +1,84 @@
++/*
++ * board/mainstone/mainstone.c
++ *
++ * Configuration settings for the Intel HCDDBBVA0 aka PXA270 Mainstone board.
++ *
++ * (C) Copyright 2006 Koan Software Engineering - Bergamo - ITALIA
++ *                    Marco Cavallini, <m.cavallini@koansoftware.com>
++ *
++ * portions from adsvix board configuration:
++ * (C) Copyright 2004
++ * Robert Whaley, Applied Data Systems, Inc. rwhaley@applieddata.net
++ * (C) Copyright 2002
++ * Kyle Harris, Nexus Technologies, Inc. kharris@nexus-tech.net
++ * (C) Copyright 2002
++ * Sysgo Real-Time Solutions, GmbH <www.elinos.com>
++ * Marius Groeger <mgroeger@sysgo.de>
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include <common.h>
++
++/* ------------------------------------------------------------------------- */
++
++/*
++ * Miscellaneous platform dependent initialisations
++ */
++
++int board_init (void)
++{
++	DECLARE_GLOBAL_DATA_PTR;
++
++	/* memory and cpu-speed are setup before relocation */
++	/* so we do _nothing_ here */
++
++	/* arch number of mainstone-Board : MACH_TYPE_MAINSTONE */
++	gd->bd->bi_arch_number = 406;
++
++	/* adress of boot parameters */
++	gd->bd->bi_boot_params = 0xa0000100;
++
++	return 0;
++}
++
++int board_late_init(void)
++{
++	setenv("stdout", "serial");
++	setenv("stderr", "serial");
++	return 0;
++}
++
++
++int dram_init (void)
++{
++	DECLARE_GLOBAL_DATA_PTR;
++
++	gd->bd->bi_dram[0].start = PHYS_SDRAM_1;
++	gd->bd->bi_dram[0].size = PHYS_SDRAM_1_SIZE;
++#if 0	
++	gd->bd->bi_dram[1].start = PHYS_SDRAM_2;
++	gd->bd->bi_dram[1].size = PHYS_SDRAM_2_SIZE;
++	gd->bd->bi_dram[2].start = PHYS_SDRAM_3;
++	gd->bd->bi_dram[2].size = PHYS_SDRAM_3_SIZE;
++	gd->bd->bi_dram[3].start = PHYS_SDRAM_4;
++	gd->bd->bi_dram[3].size = PHYS_SDRAM_4_SIZE;
++#endif
++	return 0;
++}
+diff -urNp u-boot/board/mainstone/Makefile u-boot-mainstone/board/mainstone/Makefile
+--- u-boot/board/mainstone/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/board/mainstone/Makefile	2006-03-09 16:14:35.241552640 +0100
+@@ -0,0 +1,54 @@
++#
++# board/mainstone/Makefile
++#
++# (C) Copyright 2006 Koan Software Engineering - Bergamo - ITALIA
++#                    Marco Cavallini, <m.cavallini@koansoftware.com>
++# (C) Copyright 2005
++# Frank Agius, Samsys Technologies, Inc. frank.agius@samsys.com
++#
++# (C) Copyright 2000
++# Wolfgang Denk, DENX Software Engineering, wd@denx.de.
++#
++# See file CREDITS for list of people who contributed to this
++# project.
++#
++# This program is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License as
++# published by the Free Software Foundation; either version 2 of
++# the License, or (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++# MA 02111-1307 USA
++#
++
++include $(TOPDIR)/config.mk
++
++LIB	= lib$(BOARD).a
++
++OBJS	:= mainstone.o flash.o
++SOBJS	:= lowlevel_init.o pxavoltage.o
++
++$(LIB):	$(OBJS) $(SOBJS)
++	$(AR) crv $@ $(OBJS) $(SOBJS)
++
++clean:
++	rm -f $(SOBJS) $(OBJS)
++
++distclean:	clean
++	rm -f $(LIB) core *.bak .depend
++
++#########################################################################
++
++.depend:	Makefile $(SOBJS:.o=.S) $(OBJS:.o=.c)
++		$(CC) -M $(CPPFLAGS) $(SOBJS:.o=.S) $(OBJS:.o=.c) > $@
++
++-include .depend
++
++#########################################################################
+diff -urNp u-boot/board/mainstone/pxavoltage.S u-boot-mainstone/board/mainstone/pxavoltage.S
+--- u-boot/board/mainstone/pxavoltage.S	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/board/mainstone/pxavoltage.S	2006-03-09 15:55:13.923099880 +0100
+@@ -0,0 +1,237 @@
++/*
++ * board/mainstone/pxavoltage.S
++ *
++ * Configuration settings for the Intel HCDDBBVA0 aka PXA270 Mainstone board.
++ *
++ * (C) Copyright 2006 Koan sas - Bergamo - ITALIA
++ *                    Marco Cavallini, (MCK) <m.cavallini @ koansoftware.com>
++ *
++ * This was originally from the adsvix board
++ *  (C) Copyright 2004 Robert Whaley, Applied Data Systems, Inc. rwhaley@applieddata.net
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include <asm/arch/pxa-regs.h>
++
++#define LTC1663_ADDR    0x20
++
++#define LTC1663_SY	0x01	/* Sync ACK */
++#define LTC1663_SD	0x04	/* shutdown */
++#define LTC1663_BG	0x04	/* Internal Voltage Ref */
++
++#define VOLT_1_55         18    /* DAC value for 1.55V */
++
++		.global	initPXAvoltage
++
++@ Set the voltage to 1.55V early in the boot process so we can run
++@ at a high clock speed and boot quickly.  Note that this is necessary
++@ because the reset button does not reset the CPU voltage, so if the
++@ voltage was low (say 0.85V) then the CPU would crash without this
++@ routine
++
++@ This routine clobbers r0-r4
++
++initializei2c:
++
++		ldr	r2, =CKEN
++		ldr	r3, [r2]
++		orr	r3, r3, #CKEN15_PWRI2C
++		str	r3, [r2]
++
++		ldr	r2, =PCFR
++		ldr	r3, [r2]
++		orr	r3, r3, #PCFR_PI2C_EN
++		str	r3, [r2]
++
++		/* delay for about 250msec
++		 */
++		ldr	r3, =OSCR
++		mov	r2, #0
++		str	r2, [r3]
++		ldr	r1, =0xC0000
++
++1:
++		ldr	r2, [r3]
++		cmp	r1, r2
++		bgt	1b
++		ldr	r0, =PWRICR
++		ldr	r1, [r0]
++		bic	r1, r1, #(ICR_MA | ICR_START | ICR_STOP)
++		str	r1, [r0]
++
++		orr	r1, r1, #ICR_UR
++		str	r1, [r0]
++
++		ldr	r2, =PWRISR
++		ldr	r3, =0x7ff
++		str	r3, [r2]
++
++		bic	r1, r1, #ICR_UR
++		str	r1, [r0]
++
++		mov	r1, #(ICR_GCD | ICR_SCLE)
++		str	r1, [r0]
++
++		orr	r1, r1, #ICR_IUE
++		str	r1, [r0]
++
++		orr	r1, r1, #ICR_FM
++		str	r1, [r0]
++
++		/* delay for about 1msec
++		 */
++		ldr	r3, =OSCR
++		mov	r2, #0
++		str	r2, [r3]
++		ldr	r1, =0xC00
++
++1:
++		ldr	r2, [r3]
++		cmp	r1, r2
++		bgt	1b
++		mov	pc, lr
++
++sendbytei2c:
++		ldr	r3, =PWRIDBR
++		str	r0, [r3]
++		ldr	r3, =PWRICR
++		ldr	r0, [r3]
++		orr	r0, r0, r1
++		bic	r0, r0, r2
++		str	r0, [r3]
++		orr	r0, r0, #ICR_TB
++		str	r0, [r3]
++
++		mov	r2, #0x100000
++
++waitfortxemptyi2c:
++
++		ldr	r0, =PWRISR
++		ldr	r1, [r0]
++
++		/* take it from the top if we don't get empty after a while */
++		subs	r2, r2, #1
++		moveq	lr, r4
++		beq	initPXAvoltage
++
++		tst	r1, #ISR_ITE
++
++		beq	waitfortxemptyi2c
++
++		orr	r1, r1, #ISR_ITE
++		str	r1, [r0]
++
++		mov	pc, lr
++
++initPXAvoltage:
++
++		mov	r4, lr
++
++		bl	setleds
++
++		bl	initializei2c
++
++		bl	setleds
++
++		/* now send the real message to set the correct voltage */
++		ldr	r0, =LTC1663_ADDR
++		mov	r0, r0, LSL #1
++		mov	r1, #ICR_START
++		ldr	r2, =(ICR_STOP | ICR_ALDIE | ICR_ACKNAK)
++		bl	sendbytei2c
++
++		bl	setleds
++
++		mov	r0, #LTC1663_BG
++		mov	r1, #0
++		mov	r2, #(ICR_STOP | ICR_START)
++		bl	sendbytei2c
++
++		bl	setleds
++
++		ldr	r0, =VOLT_1_55
++		and	r0, r0, #0xff
++		mov	r1, #0
++		mov	r2, #(ICR_STOP | ICR_START)
++		bl	sendbytei2c
++
++		bl	setleds
++
++		ldr	r0, =VOLT_1_55
++		mov	r0, r0, ASR #8
++		and	r0, r0, #0xff
++		mov	r1, #ICR_STOP
++		mov	r2, #ICR_START
++		bl	sendbytei2c
++
++		bl	setleds
++
++		@ delay a little for the volatage to stablize
++		ldr	r3, =OSCR
++		mov	r2, #0
++		str	r2, [r3]
++		ldr	r1, =0xC0
++
++1:
++		ldr	r2, [r3]
++		cmp	r1, r2
++		bgt	1b
++		mov	pc, r4
++
++setleds:
++	mov		pc, lr
++
++	ldr		r5, =0x40e00058
++	ldr		r3, [r5]
++	bic		r3, r3, #0x3
++	str		r3, [r5]
++	ldr		r5, =0x40e0000c
++	ldr		r3, [r5]
++	orr		r3, r3, #0x00010000
++	str		r3, [r5]
++
++	@ inner loop
++	mov		r0, #0x2
++1:
++
++	ldr		r5, =0x40e00018
++	mov		r3, #0x00010000
++	str		r3, [r5]
++
++	@ outer loop
++	mov		r3, #0x00F00000
++2:
++	subs		r3, r3, #1
++	bne		2b
++
++	ldr		r5, =0x40e00024
++	mov		r3, #0x00010000
++	str		r3, [r5]
++
++	@ outer loop
++	mov		r3, #0x00F00000
++3:
++	subs		r3, r3, #1
++	bne		3b
++
++	subs		r0, r0, #1
++	bne		1b
++
++	mov		pc, lr
+diff -urNp u-boot/board/mainstone/TODO u-boot-mainstone/board/mainstone/TODO
+--- u-boot/board/mainstone/TODO	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/board/mainstone/TODO	2006-03-09 17:52:58.522117584 +0100
+@@ -0,0 +1,12 @@
++TODO list 
++for Intel HCDDBBVA0 aka PXA270 Mainstone board.
++------------------------------------------------
++
++ Here there are work in progress, if you want to contribute please mail me.
++
++* verify enviroment settings and parameters storing in flash
++* solve MAC address problem in ethernet drivers/smc91111.c 
++
++------------------------------------------------
++Marco Cavallini, <m.cavallini@koansoftware.com>
++Koan Software Engineering - Bergamo - ITALIA
+diff -urNp u-boot/board/mainstone/u-boot.lds u-boot-mainstone/board/mainstone/u-boot.lds
+--- u-boot/board/mainstone/u-boot.lds	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/board/mainstone/u-boot.lds	2006-03-09 15:55:13.923099880 +0100
+@@ -0,0 +1,56 @@
++/*
++ * (C) Copyright 2000
++ * Wolfgang Denk, DENX Software Engineering, wd@denx.de.
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++OUTPUT_FORMAT("elf32-littlearm", "elf32-littlearm", "elf32-littlearm")
++OUTPUT_ARCH(arm)
++ENTRY(_start)
++SECTIONS
++{
++	. = 0x00000000;
++
++	. = ALIGN(4);
++	.text      :
++	{
++	  cpu/pxa/start.o	(.text)
++	  *(.text)
++	}
++
++	. = ALIGN(4);
++	.rodata : { *(.rodata) }
++
++	. = ALIGN(4);
++	.data : { *(.data) }
++
++	. = ALIGN(4);
++	.got : { *(.got) }
++
++	. = .;
++	__u_boot_cmd_start = .;
++	.u_boot_cmd : { *(.u_boot_cmd) }
++	__u_boot_cmd_end = .;
++
++	. = ALIGN(4);
++	__bss_start = .;
++	.bss : { *(.bss) }
++	_end = .;
++}
+diff -urNp u-boot/CREDITS u-boot-mainstone/CREDITS
+--- u-boot/CREDITS	2005-12-01 01:50:00.000000000 +0100
++++ u-boot-mainstone/CREDITS	2006-03-09 16:18:42.570952856 +0100
+@@ -93,6 +93,11 @@ N: Jonathan De Bruyne
+ E: jonathan.debruyne@siemens.atea.be
+ D: Port to Siemens IAD210 board
+ 
++N: Marco Cavallini
++E: m.cavallini@koansoftware.com
++D: Added support for Intel Mainstone HCDDBBVA0
++W: http://www.koansoftware.com
++
+ N: Ken Chou
+ E: kchou@ieee.org
+ D: Support for A3000 SBC board
+diff -urNp u-boot/drivers/smc91111.c u-boot-mainstone/drivers/smc91111.c
+--- u-boot/drivers/smc91111.c	2004-11-22 23:20:09.000000000 +0100
++++ u-boot-mainstone/drivers/smc91111.c	2006-03-09 18:09:21.662657504 +0100
+@@ -2,6 +2,11 @@
+  . smc91111.c
+  . This is a driver for SMSC's 91C111 single-chip Ethernet device.
+  .
++ . (C) Copyright 2006 Koan Software Engineering - Bergamo - ITALIA
++ .                    Marco Cavallini, <m.cavallini@koansoftware.com>
++ . (C) Copyright 2005
++ . Frank Agius, Samsys Technologies, Inc. frank.agius@samsys.com
++ .
+  . (C) Copyright 2002
+  . Sysgo Real-Time Solutions, GmbH <www.elinos.com>
+  . Rolf Offermanns <rof@sysgo.de>
+@@ -52,6 +57,8 @@
+  .    o	  skeleton.c by Donald Becker ( becker@cesdis.gsfc.nasa.gov )
+  .
+  . History:
++ .	DD/MM/YY
++ .	03/09/06  Marco Cavallini  Modify for Intel Mainstone
+  .	06/19/03  Richard Woodruff Made u-boot environment aware and added mac addr checks.
+  .	10/17/01  Marco Hasewinkel Modify for DNP/1110
+  .	07/25/01  Woojung Huh	   Modify for ADS Bitsy
+@@ -495,7 +502,15 @@ static void smc_enable()
+ 	SMC_SELECT_BANK( 0 );
+ 	/* see the header file for options in TCR/RCR DEFAULT*/
+ 	SMC_outw( TCR_DEFAULT, TCR_REG );
++#ifdef CONFIG_MAINSTONE
++	/* The promiscuous bit set because I could not receive ARP reply
++	 * packets from the server when I send a ARP request. It only works
++	 * when I set the promiscuous bit
++	 */
++	SMC_outw( RCR_DEFAULT | RCR_PRMS, RCR_REG );
++#else
+ 	SMC_outw( RCR_DEFAULT, RCR_REG );
++#endif
+ 
+ 	/* clear MII_DIS */
+ /*	smc_write_phy_register(PHY_CNTL_REG, 0x0000); */
+@@ -529,7 +544,6 @@ static void smc_shutdown()
+ 	SMC_outb( TCR_CLEAR, TCR_REG );
+ }
+ 
+-
+ /*
+  . Function:  smc_hardware_send_packet(struct net_device * )
+  . Purpose:
+@@ -654,7 +668,11 @@ again:
+ 		printf ("Write data fifo not empty!\n");
+ 
+ 	/* point to the beginning of the packet */
++#ifndef CONFIG_MAINSTONE
+ 	SMC_outw (PTR_AUTOINC, PTR_REG);
++#else
++	SMC_outl (PTR_AUTOINC <<16, PTR_REG-2);
++#endif
+ 
+ 	PRINTK3 ("%s: Trying to xmit packet of length %x\n",
+ 		 SMC_DEV_NAME, length);
+@@ -716,7 +734,6 @@ again:
+ 		SMC_outw (buf[length - 1] | 0x2000, SMC91111_DATA_REG);
+ 	}
+ #endif
+-
+ 	/* and let the chipset deal with it */
+ 	SMC_outw (MC_ENQUEUE, MMU_CMD_REG);
+ 
+@@ -743,6 +760,24 @@ again:
+ 
+ 		return 0;
+ 	} else {
++#ifdef USE_32_BIT
++		/* ack. int */
++		status = SMC_inb (SMC91111_INT_REG);
++                if (status & IM_TX_INT )
++                {
++ 		    SMC_outb (IM_TX_INT, SMC91111_INT_REG);
++                }
++		status = SMC_inb (SMC91111_INT_REG);
++                if (status & IM_TX_EMPTY_INT )
++ 		    SMC_outb (IM_TX_EMPTY_INT, SMC91111_INT_REG);
++		PRINTK2 ("%s: Sent packet of length %d, int status=0x%08x \n", SMC_DEV_NAME, length, status);
++
++		/* release packet */
++                /* auto release now set, no need to release the tx packet
++                 * manually
++		SMC_outb (LAN91C96_MMUCR_RELEASE_TX, LAN91C96_MMU);
++                 */
++#else
+ 		/* ack. int */
+ 		SMC_outb (IM_TX_EMPTY_INT, SMC91111_INT_REG);
+ 		/* SMC_outb (IM_TX_INT, SMC91111_INT_REG); */
+@@ -754,7 +789,7 @@ again:
+ #ifdef CONFIG_XAENIAX
+ 		SMC_outw (MC_FREEPKT, MMU_CMD_REG);
+ #endif
+-
++#endif
+ 		/* wait for MMU getting ready (low) */
+ 		while (SMC_inw (MMU_CMD_REG) & MC_BUSY) {
+ 			udelay (10);
+@@ -805,7 +840,13 @@ void smc_destructor()
+  */
+ static int smc_open (bd_t * bd)
+ {
+-	int i, err;
++	int err;
++#ifdef CONFIG_MAINSTONE 
++        long addr0_3;
++        word addr4_5;
++#else
++        int i;
++#endif
+ 
+ 	PRINTK2 ("%s: smc_open\n", SMC_DEV_NAME);
+ 
+@@ -828,6 +869,18 @@ static int smc_open (bd_t * bd)
+ 		memset (bd->bi_enetaddr, 0, 6); /* hack to make error stick! upper code will abort if not set */
+ 		return (-1);	/* upper code ignores this, but NOT bi_enetaddr */
+ 	}
++#ifdef CONFIG_MAINSTONE
++	/* writes must be on a 32 bit boundary. write first 4 bytes of mac addr,
++	 * then the last 2 bytes.
++	 */
++	addr0_3 = smc_mac_addr[3]<<24 | smc_mac_addr[2]<<16 | smc_mac_addr[1] <<8 | smc_mac_addr[0];    
++	/* write first 4 bytes. write address should be on a 32 bit boundary */
++	SMC_outl (addr0_3, ADDR0_REG);
++	addr4_5 = smc_mac_addr[5]<<8 | smc_mac_addr[4];
++	PRINTK2("writing smc_mac_addr=0x%06x%x\n",addr0_3,addr4_5);
++	/* write last 2 bytes. write address should be on a 32 bit boundary */
++	SMC_outw (addr4_5, ADDR0_REG+4);
++#else       
+ #ifdef USE_32_BIT
+ 	for (i = 0; i < 6; i += 2) {
+ 		word address;
+@@ -840,7 +893,7 @@ static int smc_open (bd_t * bd)
+ 	for (i = 0; i < 6; i++)
+ 		SMC_outb (smc_mac_addr[i], (ADDR0_REG + i));
+ #endif
+-
++#endif /* end CONFIG_MAINSTONE */
+ 	return 0;
+ }
+ 
+@@ -882,7 +935,12 @@ static int smc_rcv()
+ 
+ 	PRINTK3("%s: smc_rcv\n", SMC_DEV_NAME);
+ 	/*  start reading from the start of the packet */
++#ifndef CONFIG_MAINSTONE
+ 	SMC_outw( PTR_READ | PTR_RCV | PTR_AUTOINC, PTR_REG );
++#else
++	SMC_outl ((PTR_READ | PTR_RCV |
++			  PTR_AUTOINC)<<16, 4);
++#endif
+ 
+ 	/* First two words are status and packet_length */
+ #ifdef USE_32_BIT
+@@ -1381,7 +1439,11 @@ static void smc_phy_configure ()
+ 
+ 	/* Configure the Receive/Phy Control register */
+ 	SMC_SELECT_BANK (0);
++#ifdef CONFIG_MAINSTONE 
++        SMC_outl (RPC_DEFAULT<<16, RPC_REG-2);
++#else
+ 	SMC_outw (RPC_DEFAULT, RPC_REG);
++#endif
+ 
+ 	/* Copy our capabilities from PHY_STAT_REG to PHY_AD_REG */
+ 	my_phy_caps = smc_read_phy_register (PHY_STAT_REG);
+@@ -1459,7 +1521,11 @@ static void smc_phy_configure ()
+ 	}
+ 
+ 	/* Re-Configure the Receive/Phy Control register */
++#ifdef CONFIG_MAINSTONE 
++        SMC_outl (RPC_DEFAULT<<16, RPC_REG-2);
++#else
+ 	SMC_outw (RPC_DEFAULT, RPC_REG);
++#endif
+ 
+ smc_phy_configure_exit:	;
+ 
+diff -urNp u-boot/drivers/smc91111.h u-boot-mainstone/drivers/smc91111.h
+--- u-boot/drivers/smc91111.h	2004-11-02 14:00:56.000000000 +0100
++++ u-boot-mainstone/drivers/smc91111.h	2006-03-09 17:33:19.781313424 +0100
+@@ -1,6 +1,8 @@
+ /*------------------------------------------------------------------------
+  . smc91111.h - macros for the LAN91C111 Ethernet Driver
+  .
++ . (C) Copyright 2006 Koan Software Engineering - Bergamo - ITALIA
++ .                    Marco Cavallini, <m.cavallini@koansoftware.com>
+  . (C) Copyright 2002
+  . Sysgo Real-Time Solutions, GmbH <www.elinos.com>
+  . Rolf Offermanns <rof@sysgo.de>
+@@ -678,8 +680,11 @@ enum {
+  --------------------------------------------------------------------------*/
+ 
+ /* select a register bank, 0 to 3  */
+-
++#ifdef CONFIG_MAINSTONE
++#define SMC_SELECT_BANK(x)  { SMC_outl( (x)<<16, 12 ); }
++#else
+ #define SMC_SELECT_BANK(x)  { SMC_outw( x, BANK_SELECT ); }
++#endif
+ 
+ /* this enables an interrupt in the interrupt mask register */
+ #define SMC_ENABLE_INT(x) {\
+diff -urNp u-boot/include/configs/mainstone.h u-boot-mainstone/include/configs/mainstone.h
+--- u-boot/include/configs/mainstone.h	1970-01-01 01:00:00.000000000 +0100
++++ u-boot-mainstone/include/configs/mainstone.h	2006-03-09 17:45:27.525679464 +0100
+@@ -0,0 +1,300 @@
++/*
++ * include/configs/mainstone.h
++ *
++ * Configuration settings for the Intel HCDDBBVA0 aka PXA270 Mainstone board.
++ *
++ * (C) Copyright 2006 Koan Software Engineering - Bergamo - ITALIA
++ *                    Marco Cavallini, <m.cavallini@koansoftware.com>
++ * (C) Copyright 2005
++ * Frank Agius, Samsys Technologies, Inc. frank.agius@samsys.com
++ *
++ * portions from adsvix board configuration:
++ * (C) Copyright 2004
++ * Robert Whaley, Applied Data Systems, Inc. rwhaley@applieddata.net
++ * (C) Copyright 2002
++ * Kyle Harris, Nexus Technologies, Inc. kharris@nexus-tech.net
++ * (C) Copyright 2002
++ * Sysgo Real-Time Solutions, GmbH <www.elinos.com>
++ * Marius Groeger <mgroeger@sysgo.de>
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#ifndef __CONFIG_H
++#define __CONFIG_H
++
++/*
++ * High Level Configuration Options
++ * (easy to change)
++ */
++#define CONFIG_PXA27X		1	/* This is an PXA27x CPU */
++#define CONFIG_MAINSTONE	1	/* on Intel Mainstone Board     */
++#undef CONFIG_LCD
++
++#ifdef CONFIG_LCD
++#define CONFIG_HITACHI_SX14
++#endif
++
++#define CONFIG_MMC		1
++#define BOARD_LATE_INIT		1
++#undef CONFIG_USE_IRQ			/* we don't need IRQ/FIQ stuff */
++#define RTC
++
++/*
++ * Size of malloc() pool
++ */
++#define CFG_MALLOC_LEN	    (CFG_ENV_SIZE + 128*1024)
++#define CFG_GBL_DATA_SIZE	128	/* size in bytes reserved for initial data */
++
++/*
++ * Hardware drivers
++ */
++#define	CONFIG_DRIVER_SMC91111		/* Using SMC91c111	*/
++#define CONFIG_SMC91111_BASE 	0x10000300 
++#define CONFIG_SMC_USE_32_BIT
++//#define CONFIG_SMC_PXA270
++#undef  CONFIG_SMC_91111_EXT_PHY	/* we use internal phy   */
++#undef  CONFIG_SHOW_ACTIVITY
++#define CONFIG_NET_RETRY_COUNT	10	/* # of retries          */
++
++/*
++ * select serial console configuration
++ */
++#define CONFIG_FFUART	       1       /* we use FFUART on Mainstone */
++
++/* allow to overwrite serial and ethaddr */
++#define CONFIG_ENV_OVERWRITE
++#define CONFIG_BAUDRATE	       115200
++
++#define CONFIG_COMMANDS		(CONFIG_CMD_DFL |\
++                                 CFG_CMD_DIAG |\
++                                 CFG_CMD_DHCP |\
++                                 CFG_CMD_NFS)
++			
++/* this must be included AFTER the definition of CONFIG_COMMANDS (if any) */
++#include <cmd_confdefs.h>
++
++#undef CONFIG_SHOW_BOOT_PROGRESS
++
++#define CONFIG_BOOTDELAY	5
++#define CONFIG_ETHADDR		01:23:45:67:89:ab
++#define CONFIG_NETMASK		255.255.255.0
++#define CONFIG_IPADDR		192.168.0.184
++#define CONFIG_SERVERIP		192.168.0.5
++#define CONFIG_BOOTCOMMAND	"bootm 40000"
++#define CONFIG_BOOTARGS		"root=/dev/mtdblock2 rootfstype=jffs2 ip=dhcp console=ttyS0,115200"
++
++#define CONFIG_SETUP_MEMORY_TAGS 1
++#define CONFIG_CMDLINE_TAG	 1	/* enable passing of ATAGs	*/
++
++
++#if (CONFIG_COMMANDS & CFG_CMD_KGDB)
++#define CONFIG_KGDB_BAUDRATE	230400		/* speed to run kgdb serial port */
++#define CONFIG_KGDB_SER_INDEX	2		/* which serial port to use */
++#endif
++
++/*
++ * Miscellaneous configurable options
++ */
++#define CFG_HUSH_PARSER		1
++#define CFG_PROMPT_HUSH_PS2	"> "
++
++#define CFG_LONGHELP				/* undef to save memory		*/
++#define CFG_PROMPT		"U-Boot> "	/* Monitor Command Prompt */
++
++#define CFG_CBSIZE		256		/* Console I/O Buffer Size	*/
++#define CFG_PBSIZE (CFG_CBSIZE+sizeof(CFG_PROMPT)+16) /* Print Buffer Size */
++#define CFG_MAXARGS		16		/* max number of command args	*/
++#define CFG_BARGSIZE		CFG_CBSIZE	/* Boot Argument Buffer Size	*/
++#define CFG_DEVICE_NULLDEV	1
++
++#define CFG_MEMTEST_START	0xa0400000	/* memtest works on	*/
++#define CFG_MEMTEST_END		0xa0800000	/* 4 ... 8 MB in DRAM	*/
++
++#undef	CFG_CLKS_IN_HZ		/* everything, incl board info, in Hz */
++
++#define CFG_LOAD_ADDR		0xa1000000	/* default load address */
++
++#define CFG_HZ			3686400		/* incrementer freq: 3.6864 MHz */
++#define CFG_CPUSPEED		0x207		/* need to look more closely, I think this is Turbo = 2x, L=91Mhz */
++
++						/* valid baudrates */
++#define CFG_BAUDRATE_TABLE	{ 9600, 19200, 38400, 57600, 115200 }
++
++#define CFG_MMC_BASE		0xF0000000
++
++/*
++ * Stack sizes
++ *
++ * The stack sizes are set up in start.S using the settings below
++ */
++#define CONFIG_STACKSIZE	(128*1024)	/* regular stack */
++#ifdef CONFIG_USE_IRQ
++#define CONFIG_STACKSIZE_IRQ	(4*1024)	/* IRQ stack */
++#define CONFIG_STACKSIZE_FIQ	(4*1024)	/* FIQ stack */
++#endif
++
++/*
++ * Physical Memory Map
++ */
++#define CONFIG_NR_DRAM_BANKS	1	   /* we have 1 bank of DRAM */
++#define PHYS_SDRAM_1		0xa0000000 /* SDRAM Bank #1 */
++#define PHYS_SDRAM_1_SIZE	0x04000000 /* 64 MB */
++#define PHYS_SDRAM_2		0xa4000000 /* SDRAM Bank #2 */
++#define PHYS_SDRAM_2_SIZE	0x00000000 /* 0 MB */
++#define PHYS_SDRAM_3		0xa8000000 /* SDRAM Bank #3 */
++#define PHYS_SDRAM_3_SIZE	0x00000000 /* 0 MB */
++#define PHYS_SDRAM_4		0xac000000 /* SDRAM Bank #4 */
++#define PHYS_SDRAM_4_SIZE	0x00000000 /* 0 MB */
++
++#define PHYS_FLASH_1		0x00000000 /* Flash Bank #1 */
++#define PHYS_FLASH_2		0x04000000 /* Flash Bank #2 */
++#define PHYS_FLASH_BANK_SIZE	0x02000000 /* 32 MB Banks */
++#define PHYS_FLASH_SECT_SIZE	0x00040000 /* 128 KB sectors (x2) */
++
++#define CFG_DRAM_BASE		0xa0000000
++#define CFG_DRAM_SIZE		0x04000000
++
++#define CFG_FLASH_BASE		PHYS_FLASH_1
++
++#define PLATFORM_REGISTERS	__REG(0x08000000)
++#define PLATFORM_SWITCH 	0x60
++
++/*
++ * GPIO settings for Mainstone
++ */
++
++#define CFG_GPSR0_VAL		0x00708800
++#define CFG_GPSR1_VAL		0x03cf0002
++#define CFG_GPSR2_VAL		0x0021FC00
++#define CFG_GPSR3_VAL		0x00000000
++
++#define CFG_GPCR0_VAL		0x00001000
++#define CFG_GPCR1_VAL		0x00000000
++#define CFG_GPCR2_VAL		0x00000000
++#define CFG_GPCR3_VAL		0x00000000
++
++#define CFG_GPDR0_VAL		0xC27B9C04
++#define CFG_GPDR1_VAL		0x00EFAA83
++#define CFG_GPDR2_VAL		0x0E23FC00
++#define CFG_GPDR3_VAL		0x001E1F81
++
++#define CFG_GAFR0_L_VAL		0x94F00000
++#define CFG_GAFR0_U_VAL		0x015A859A
++#define CFG_GAFR1_L_VAL		0x999A955A
++#define CFG_GAFR1_U_VAL		0x0005A4AA
++#define CFG_GAFR2_L_VAL		0x6AA00000
++#define CFG_GAFR2_U_VAL		0x55A8041A
++#define CFG_GAFR3_L_VAL		0x56AA955A
++#define CFG_GAFR3_U_VAL		0x00000001
++
++#define CFG_PSSR_VAL		0x20	// ???????????
++
++/*
++ * Clock settings
++ */
++#define CFG_CKEN		0x00400200
++#define CFG_CCCR		0x02000290 /*   520Mhz */
++
++/*
++ * Memory settings
++ */
++
++//#define CFG_MSC0_VAL		0x39F2A7A3 // DO NOT SET IT !
++#define CFG_MSC1_VAL		0x0000A691
++#define CFG_MSC2_VAL		0x0000B884
++
++#define CFG_MDCNFG_VAL		0x00000AC8 /* start with SDRAM part. disabled */
++#define CFG_MDREFR_VAL		0x20ca2018 
++#define CFG_MDMRS_VAL		0x00000000
++
++#define CFG_FLYCNFG_VAL		0x00010001
++#define CFG_SXCNFG_VAL		0x40044004
++
++/*
++ * PCMCIA and CF Interfaces
++ */
++#define CFG_MECR_VAL		0x00000001
++#define CFG_MCMEM0_VAL		0x00010204
++#define CFG_MCMEM1_VAL		0x00010204
++#define CFG_MCATT0_VAL		0x00010204
++#define CFG_MCATT1_VAL		0x00010204
++#define CFG_MCIO0_VAL		0x0000c108
++#define CFG_MCIO1_VAL		0x0001c108
++
++//#define CONFIG_PXA_PCMCIA 1
++//#define CONFIG_PXA_IDE 1
++
++#define CONFIG_PCMCIA_SLOT_A 1
++/* just to keep build system happy  */
++
++#define CFG_PCMCIA_MEM_ADDR     0x28000000
++#define CFG_PCMCIA_MEM_SIZE     0x04000000
++
++#define CFG_IDE_MAXBUS		1
++/* max. 1 IDE bus		*/
++#define CFG_IDE_MAXDEVICE	1
++/* max. 1 drive per IDE bus	*/
++
++#define CFG_ATA_IDE0_OFFSET	0x0000
++
++#define CFG_ATA_BASE_ADDR	0x20000000
++
++/* Offset for data I/O			*/
++#define CFG_ATA_DATA_OFFSET	0x1f0
++
++/* Offset for normal register accesses	*/
++#define CFG_ATA_REG_OFFSET	0x1f0
++
++/* Offset for alternate registers	*/
++#define CFG_ATA_ALT_OFFSET	0x3f0
++
++/*
++ * FLASH and environment organization
++ */
++
++#define CFG_FLASH_CFI
++#define CFG_FLASH_CFI_DRIVER	1
++
++#define CFG_MONITOR_BASE	0
++#define CFG_MONITOR_LEN		0x20000
++
++#define CFG_MAX_FLASH_BANKS	1	/* max number of memory banks		*/
++#define CFG_MAX_FLASH_SECT	4 + 255  /* max number of sectors on one chip    */
++
++/* timeout values are in ticks */
++#define CFG_FLASH_ERASE_TOUT	(25*CFG_HZ) /* Timeout for Flash Erase */
++#define CFG_FLASH_WRITE_TOUT	(25*CFG_HZ) /* Timeout for Flash Write */
++
++/* write flash less slowly */
++#define CFG_FLASH_USE_BUFFER_WRITE 1
++
++/* Flash environment locations */
++#define CFG_ENV_IS_IN_FLASH	1
++#define CFG_ENV_ADDR		(PHYS_FLASH_1 + CFG_MONITOR_LEN)	/* Addr of Environment Sector	*/
++#define CFG_ENV_SIZE		0x20000	/* Total Size of Environment     	*/
++#define CFG_ENV_SECT_SIZE	0x20000	/* Total Size of Environment Sector	*/
++
++/* FPGA */
++#define MST_FPGA_BASE		0x08000000
++#define MST_LEDDAT1		0x08000010
++#define MST_LEDDAT2		0x08000014
++#define MST_LEDCTL		0x08000040
++
++#endif	/* __CONFIG_H */
+diff -urNp u-boot/MAINTAINERS u-boot-mainstone/MAINTAINERS
+--- u-boot/MAINTAINERS	2005-12-01 01:50:00.000000000 +0100
++++ u-boot-mainstone/MAINTAINERS	2006-03-09 15:55:13.924099728 +0100
+@@ -379,6 +379,10 @@ Rick Bronson <rick@efn.org>
+ 
+ 	AT91RM9200DK		at91rm9200
+ 
++Marco Cavallini <m.cavallini@koansoftware.com>
++
++	mainstone		xscale
++
+ George G. Davis <gdavis@mvista.com>
+ 
+ 	assabet			SA1100
+diff -urNp u-boot/MAKEALL u-boot-mainstone/MAKEALL
+--- u-boot/MAKEALL	2006-03-07 00:51:15.000000000 +0100
++++ u-boot-mainstone/MAKEALL	2006-03-09 16:17:59.127557256 +0100
+@@ -176,11 +176,12 @@ LIST_ARM9="	\
+ 	at91rm9200dk	cmc_pu2						\
+ 	ap920t		ap922_XA10	ap926ejs	ap946es		\
+ 	ap966		cp920t		cp922_XA10	cp926ejs	\
+-	cp946es		cp966		lpd7a400	mp2usb		\
+-	mx1ads		mx1fs2		netstar		omap1510inn	\
+-	omap1610h2	omap1610inn	omap730p2	scb9328		\
+-	smdk2400	smdk2410	trab		VCMA9		\
+-	versatile	versatileab	versatilepb	voiceblue
++	cp946es		cp966		lpd7a400	mainstone	\
++	mp2usb		mx1ads		mx1fs2		netstar		\
++	omap1510inn	omap1610h2	omap1610inn	omap730p2	\
++	scb9328		smdk2400	smdk2410	trab		\
++	VCMA9		versatile	versatileab	versatilepb	\
++	voiceblue							\
+ "
+ 
+ #########################################################################
+diff -urNp u-boot/Makefile u-boot-mainstone/Makefile
+--- u-boot/Makefile	2006-03-07 00:51:15.000000000 +0100
++++ u-boot-mainstone/Makefile	2006-03-09 15:55:13.926099424 +0100
+@@ -1630,6 +1630,9 @@ modnet50_config :	unconfig
+ evb4510_config :	unconfig
+ 	@./mkconfig $(@:_config=) arm arm720t evb4510
+ 
++mainstone_config :	unconfig
++	@./mkconfig $(@:_config=) arm pxa mainstone
++
+ #########################################################################
+ ## XScale Systems
+ #########################################################################
+diff -urNp u-boot/README u-boot-mainstone/README
+--- u-boot/README	2005-11-22 14:39:09.000000000 +0100
++++ u-boot-mainstone/README	2006-03-09 15:55:13.928099120 +0100
+@@ -308,9 +308,9 @@ The following options need to be configu
+ 		CONFIG_H2_OMAP1610,	CONFIG_HHP_CRADLE,	CONFIG_IMPA7,
+ 		CONFIG_INNOVATOROMAP1510, CONFIG_INNOVATOROMAP1610, CONFIG_KB9202,
+ 		CONFIG_LART,		CONFIG_LPD7A400,	CONFIG_LUBBOCK,
+-		CONFIG_OSK_OMAP5912,	CONFIG_OMAP2420H4,	CONFIG_SHANNON,
+-		CONFIG_P2_OMAP730,	CONFIG_SMDK2400,	CONFIG_SMDK2410,
+-		CONFIG_TRAB,		CONFIG_VCMA9
++		CONFIG_MAINSTONE,	CONFIG_OSK_OMAP5912,	CONFIG_OMAP2420H4,
++		CONFIG_SHANNON,		CONFIG_P2_OMAP730,	CONFIG_SMDK2400,
++		CONFIG_SMDK2410,	CONFIG_TRAB,		CONFIG_VCMA9
+ 
+ 		MicroBlaze based boards:
+ 		------------------------

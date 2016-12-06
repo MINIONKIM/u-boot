@@ -1,0 +1,20 @@
+--- MAKEALL	2006-03-07 00:51:15.000000000 +0100
++++ MAKEALL	2006-03-09 16:17:59.127557256 +0100
+@@ -176,11 +176,12 @@ LIST_ARM9="	\
+ 	at91rm9200dk	cmc_pu2						\
+ 	ap920t		ap922_XA10	ap926ejs	ap946es		\
+ 	ap966		cp920t		cp922_XA10	cp926ejs	\
+-	cp946es		cp966		lpd7a400	mp2usb		\
+-	mx1ads		mx1fs2		netstar		omap1510inn	\
+-	omap1610h2	omap1610inn	omap730p2	scb9328		\
+-	smdk2400	smdk2410	trab		VCMA9		\
+-	versatile	versatileab	versatilepb	voiceblue
++	cp946es		cp966		lpd7a400	mainstone	\
++	mp2usb		mx1ads		mx1fs2		netstar		\
++	omap1510inn	omap1610h2	omap1610inn	omap730p2	\
++	scb9328		smdk2400	smdk2410	trab		\
++	VCMA9		versatile	versatileab	versatilepb	\
++	voiceblue							\
+ "
+ 
+ #########################################################################

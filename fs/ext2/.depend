@@ -1,0 +1,54 @@
+# 1 "/home/minion/u-boot-1.1.4/fs/ext2//"
+ext2fs.o: ext2fs.c /home/minion/u-boot-1.1.4/include/common.h \
+  /home/minion/u-boot-1.1.4/include/config.h \
+  /home/minion/u-boot-1.1.4/include/configs/mainstone.h \
+  /home/minion/u-boot-1.1.4/include/cmd_confdefs.h \
+  /home/minion/u-boot-1.1.4/include/linux/bitops.h \
+  /home/minion/u-boot-1.1.4/include/asm/bitops.h \
+  /home/minion/u-boot-1.1.4/include/linux/types.h \
+  /home/minion/u-boot-1.1.4/include/linux/config.h \
+  /home/minion/u-boot-1.1.4/include/linux/posix_types.h \
+  /home/minion/u-boot-1.1.4/include/linux/stddef.h \
+  /home/minion/u-boot-1.1.4/include/asm/posix_types.h \
+  /home/minion/u-boot-1.1.4/include/asm/types.h \
+  /home/minion/u-boot-1.1.4/include/linux/string.h \
+  /home/minion/u-boot-1.1.4/include/asm/string.h \
+  /home/minion/u-boot-1.1.4/include/asm/ptrace.h \
+  /home/minion/u-boot-1.1.4/include/asm/proc/ptrace.h \
+  /home/minion/usr/bin/../lib/gcc/arm-linux/3.4.3/include/stdarg.h \
+  /home/minion/u-boot-1.1.4/include/part.h \
+  /home/minion/u-boot-1.1.4/include/ide.h \
+  /home/minion/u-boot-1.1.4/include/flash.h \
+  /home/minion/u-boot-1.1.4/include/image.h \
+  /home/minion/u-boot-1.1.4/include/asm/u-boot.h \
+  /home/minion/u-boot-1.1.4/include/asm/global_data.h \
+  /home/minion/u-boot-1.1.4/include/asm/mach-types.h \
+  /home/minion/u-boot-1.1.4/include/asm/setup.h \
+  /home/minion/u-boot-1.1.4/include/asm/u-boot-arm.h
+# 1 "/home/minion/u-boot-1.1.4/fs/ext2//"
+dev.o: dev.c /home/minion/u-boot-1.1.4/include/common.h \
+  /home/minion/u-boot-1.1.4/include/config.h \
+  /home/minion/u-boot-1.1.4/include/configs/mainstone.h \
+  /home/minion/u-boot-1.1.4/include/cmd_confdefs.h \
+  /home/minion/u-boot-1.1.4/include/linux/bitops.h \
+  /home/minion/u-boot-1.1.4/include/asm/bitops.h \
+  /home/minion/u-boot-1.1.4/include/linux/types.h \
+  /home/minion/u-boot-1.1.4/include/linux/config.h \
+  /home/minion/u-boot-1.1.4/include/linux/posix_types.h \
+  /home/minion/u-boot-1.1.4/include/linux/stddef.h \
+  /home/minion/u-boot-1.1.4/include/asm/posix_types.h \
+  /home/minion/u-boot-1.1.4/include/asm/types.h \
+  /home/minion/u-boot-1.1.4/include/linux/string.h \
+  /home/minion/u-boot-1.1.4/include/asm/string.h \
+  /home/minion/u-boot-1.1.4/include/asm/ptrace.h \
+  /home/minion/u-boot-1.1.4/include/asm/proc/ptrace.h \
+  /home/minion/usr/bin/../lib/gcc/arm-linux/3.4.3/include/stdarg.h \
+  /home/minion/u-boot-1.1.4/include/part.h \
+  /home/minion/u-boot-1.1.4/include/ide.h \
+  /home/minion/u-boot-1.1.4/include/flash.h \
+  /home/minion/u-boot-1.1.4/include/image.h \
+  /home/minion/u-boot-1.1.4/include/asm/u-boot.h \
+  /home/minion/u-boot-1.1.4/include/asm/global_data.h \
+  /home/minion/u-boot-1.1.4/include/asm/mach-types.h \
+  /home/minion/u-boot-1.1.4/include/asm/setup.h \
+  /home/minion/u-boot-1.1.4/include/asm/u-boot-arm.h

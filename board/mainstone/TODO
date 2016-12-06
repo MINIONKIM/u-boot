@@ -1,0 +1,12 @@
+TODO list 
+for Intel HCDDBBVA0 aka PXA270 Mainstone board.
+------------------------------------------------
+
+ Here there are work in progress, if you want to contribute please mail me.
+
+* verify enviroment settings and parameters storing in flash
+* solve MAC address problem in ethernet drivers/smc91111.c 
+
+------------------------------------------------
+Marco Cavallini, <m.cavallini@koansoftware.com>
+Koan Software Engineering - Bergamo - ITALIA
